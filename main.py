@@ -220,10 +220,35 @@ def main(_user, _passwd, min_1, max_1):
 
 # 获取时间戳
 def get_time():
-    url = 'http://worldtimeapi.org/api/timezone/Asia/Shanghai'
-    response = requests.get(url, headers=headers).json()
-    t = str(response['unixtime'])+'000'
-    return t
+    time_sources = [
+        'http://worldtimeapi.org/api/timezone/Asia/Shanghai',
+        'http://api.timezonedb.com/v2.1/get-time-zone?key=YOUR_API_KEY&format=json&by=zone&zone=Asia/Shanghai',
+        'http://worldclockapi.com/api/json/est/now'
+    ]
+    
+    for url in time_sources:
+        try:
+            response = requests.get(url, headers=headers, timeout=5)
+            response.raise_for_status()
+            data = response.json()
+            
+            if 'unixtime' in data:
+                t = str(data['unixtime']) + '000'
+            elif 'timestamp' in data:
+                t = str(data['timestamp']) + '000'
+            elif 'currentDateTime' in data:
+                dt = datetime.datetime.strptime(data['currentDateTime'], "%Y-%m-%dT%H:%M:%S%z")
+                t = str(int(dt.timestamp())) + '000'
+            else:
+                continue
+                
+            return t
+        except (requests.exceptions.RequestException, ValueError, KeyError):
+            continue
+    
+    # If all sources fail, use local time as fallback
+    return str(int(time.time())) + '000'
+
 
 
 # 获取app_token
