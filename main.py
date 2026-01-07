@@ -11,6 +11,7 @@ import pytz
 import urllib
 import requests
 from Crypto.Cipher import AES
+import base64
 
 # 获取区域天气情况
 def get_factor_by_weather(area):
@@ -49,6 +50,16 @@ def encrypt_data(plain: bytes) -> bytes:
     pad_len = AES.block_size - (len(plain) % AES.block_size)
     padded = plain + bytes([pad_len]) * pad_len
     return cipher.encrypt(padded)
+
+# 解密响应数据
+def decrypt_data(cipher_text: bytes) -> bytes:
+    key = b'xeNtBVqzDc6tuNTh'  # 16 bytes
+    iv = b'MAAAYAAAAAAAAABg'  # 16 bytes
+    cipher = AES.new(key, AES.MODE_CBC, iv)
+    decrypted = cipher.decrypt(cipher_text)
+    # 移除 PKCS#7 填充
+    pad_len = decrypted[-1]
+    return decrypted[:-pad_len]
 
 # 获取当前时间对应的最大和最小步数
 def get_step_by_time(beijing_time, factor):
@@ -103,9 +114,15 @@ def execute(user, password, min_step, max_step):
 
     data = f'userid={userid}&last_sync_data_time=1597306380&device_type=0&last_deviceid=DA932FFFFE8816E7&data_json={data_json}'
 
-    response = requests.post(url, data=data, headers=head).json()
-    print(f"修改步数（{step}）[" + response['message'] + "]")
-    print(f"账号：{user[:3]}****{user[7:]}\n修改步数（{step}）[" + response['message'] + "]\n")
+    resp = requests.post(url, data=data, headers=head)
+    try:
+        response = resp.json()
+    except ValueError:
+        print(f"提交修改步数时返回非JSON: status={resp.status_code}, text={resp.text!r}")
+        return False
+    msg = response.get('message')
+    print(f"修改步数（{step}）[{msg}]")
+    print(f"账号：{user[:3]}****{user[7:]}\n修改步数（{step}）[{msg}]\n")
     return True
 
 
@@ -151,15 +168,56 @@ def login(user, password, fake_ip):
     plaintext = query.encode('utf-8')
     # 执行请求加密
     cipher_data = encrypt_data(plaintext)
-
     url1 = 'https://api-user.zepp.com/v2/registrations/tokens'
-    r1 = requests.post(url1, data=cipher_data, headers=headers, allow_redirects=False)
-    location = r1.headers["Location"]
+    def attempt_send(body, content_type):
+        h = headers.copy()
+        h['content-type'] = content_type
+        r = requests.post(url1, data=body, headers=h, allow_redirects=False)
+        print(f"registrations/tokens tried content-type={content_type}, status={r.status_code}")
+        print(f"response headers: {r.headers}")
+        print(f"response body (repr, first 200 bytes): {repr(r.content[:200])}")
+        return r
+
+    # Try several encodings until we get the expected redirect
+    r1 = attempt_send(cipher_data, 'application/octet-stream')
+    if r1.status_code not in (302, 303):
+        r1 = attempt_send(base64.b64encode(cipher_data), 'application/octet-stream')
+    if r1.status_code not in (302, 303):
+        r1 = attempt_send(cipher_data.hex().encode('ascii'), 'text/plain')
+    if r1.status_code not in (302, 303):
+        # Try percent-encoding the raw bytes (like PHP's urlencode on a binary string)
+        try:
+            pct = urllib.parse.quote_from_bytes(cipher_data)
+            r1 = attempt_send(pct.encode('ascii'), 'application/x-www-form-urlencoded')
+        except Exception as e:
+            print(f"percent-encode attempt failed: {e}")
+    if r1.status_code not in (302, 303):
+        # Try raw bytes with the original form content-type including charset
+        r1 = attempt_send(cipher_data, 'application/x-www-form-urlencoded; charset=UTF-8')
+    if r1.status_code not in (302, 303):
+        # Finally, try sending without setting Content-Type (let requests decide)
+        h = headers.copy()
+        if 'content-type' in h:
+            h.pop('content-type')
+        r = requests.post(url1, data=cipher_data, headers=h, allow_redirects=False)
+        print(f"registrations/tokens tried no Content-Type header, status={r.status_code}")
+        print(f"response headers: {r.headers}")
+        print(f"response body (repr, first 200 bytes): {repr(r.content[:200])}")
+        r1 = r
+    if r1.status_code not in (302, 303):
+        print(f"registrations/tokens failed (last status={r1.status_code}). Full response:\nheaders={r1.headers}\ntext={r1.text!r}")
+        return 0, 0
+
+    location = r1.headers.get("Location")
+    if not location:
+        print("registrations/tokens did not return a Location header; headers:", r1.headers)
+        return 0, 0
     try:
         code = get_access_token(location)
         if code is None:
             print("获取accessToken失败")
             return 0, 0
+        print(f"[DEBUG] Extracted access token (first 50 chars): {code[:50]}...")
     except Exception as e:
         print(f"获取accessToken异常: {e}")
         return 0, 0
@@ -192,13 +250,49 @@ def login(user, password, fake_ip):
             "source": "com.xiaomi.hm.health",
             "third_name": "email",
         }
-    r2 = requests.post(url2, data=data2, headers=headers).json()
-    login_token = r2["token_info"]["login_token"]
-    userid = r2["token_info"]["user_id"]
+    print(f"[DEBUG] Posting to account.huami.com with data keys: {list(data2.keys())}")
+    print(f"[DEBUG] Data code value (first 50 chars): {data2.get('code', 'N/A')[:50]}...")
+    
+    # 对请求数据进行加密
+    data2_query = urllib.parse.urlencode(data2)
+    data2_encrypted = encrypt_data(data2_query.encode('utf-8'))
+    
+    # 使用加密数据发送请求
+    headers2 = headers.copy()
+    headers2['content-type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+    r2_resp = requests.post(url2, data=data2_encrypted, headers=headers2)
+    print(f"[DEBUG] account.huami.com response status: {r2_resp.status_code}")
+    print(f"[DEBUG] account.huami.com response headers: {r2_resp.headers}")
+    
+    # 检查响应是否为加密数据
+    content_type = r2_resp.headers.get('Content-Type', '')
+    if 'application/octet-stream' in content_type or r2_resp.status_code == 400:
+        try:
+            # 尝试解密响应
+            decrypted = decrypt_data(r2_resp.content)
+            print(f"[DEBUG] Decrypted response: {decrypted[:200]}")
+            r2 = json.loads(decrypted.decode('utf-8'))
+        except Exception as e:
+            print(f"login() failed to decrypt response: status={r2_resp.status_code}, error={e}")
+            print(f"[DEBUG] Response content (hex, first 100 bytes): {r2_resp.content[:100].hex()}")
+            return 0, 0
+    else:
+        try:
+            r2 = r2_resp.json()
+        except Exception as e:
+            print(f"login() returned non-JSON response: status={r2_resp.status_code}, text={r2_resp.text!r}, error={e}")
+            print(f"[DEBUG] Response content (hex, first 100 bytes): {r2_resp.content[:100].hex()}")
+            return 0, 0
+    try:
+        login_token = r2["token_info"]["login_token"]
+        userid = r2["token_info"]["user_id"]
+    except Exception as e:
+        print(f"login() unexpected JSON structure: {e}, json={r2}")
+        return 0, 0
     return login_token, userid
 
 def get_access_token(location):
-    code_pattern = re.compile("(?<=access=).*?(?=&)")
+    code_pattern = re.compile("(?<=access=).*?(?=&|$)")
     result = code_pattern.findall(location)
     if result is None or len(result) == 0:
         return None
@@ -208,7 +302,15 @@ def get_access_token(location):
 def get_app_token(login_token, fake_ip):
     url = f"https://account-cn.huami.com/v1/client/app_tokens?app_name=com.xiaomi.hm.health&dn=api-user.huami.com%2Capi-mifit.huami.com%2Capp-analytics.huami.com&login_token={login_token}"
     headers = {'User-Agent': 'MiFit/5.3.0 (iPhone; iOS 14.7.1; Scale/3.00)', 'X-Forwarded-For': fake_ip}
-    response = requests.get(url, headers=headers).json()
+    resp = requests.get(url, headers=headers)
+    try:
+        response = resp.json()
+    except ValueError:
+        print(f"get_app_token returned non-JSON response: status={resp.status_code}, text={resp.text!r}")
+        return None
+    if 'token_info' not in response or 'app_token' not in response['token_info']:
+        print(f"get_app_token missing app_token in response: {response}")
+        return None
     app_token = response['token_info']['app_token']
     return app_token
 
